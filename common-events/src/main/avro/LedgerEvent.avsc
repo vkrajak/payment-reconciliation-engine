@@ -1,0 +1,58 @@
+{
+  "type": "record",
+  "name": "LedgerEvent",
+  "namespace": "com.recon.events",
+  "doc": "Emitted by the internal ledger service the instant a transaction is posted. Published to topic 'ledger-events', keyed by transactionRef. NOTE: field names here are camelCase (not the snake_case used in the original design doc's illustrative JSON) deliberately -- Avro's Java code generator does not camelCase snake_case field names for you (a field named transaction_ref generates setTransaction_ref, not setTransactionRef), so camelCase field names are used from the start to keep the generated POJOs idiomatic Java.",
+  "fields": [
+    {
+      "name": "eventId",
+      "type": "string",
+      "doc": "UUID, unique per publish attempt. This is the idempotency key -- NOT the business key. A retried publish of the same business transaction gets a NEW eventId, and downstream services dedupe on this field via the processed_events table."
+    },
+    {
+      "name": "transactionRef",
+      "type": "string",
+      "doc": "Business key. Same value appears in the corresponding PspEvent and BankEvent for the same real-world transaction. This is the Kafka partition key for all three topics."
+    },
+    {
+      "name": "accountId",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": {
+        "type": "bytes",
+        "logicalType": "decimal",
+        "precision": 18,
+        "scale": 2
+      },
+      "doc": "Never use double/float for money. Decimal(18,2) supports up to 9,999,999,999,999,999.99 -- comfortably beyond any realistic single transaction."
+    },
+    {
+      "name": "currency",
+      "type": "string",
+      "doc": "ISO 4217 alpha code, e.g. 'INR', 'USD'."
+    },
+    {
+      "name": "txnType",
+      "type": {
+        "type": "enum",
+        "name": "TxnType",
+        "symbols": ["DEBIT", "CREDIT"]
+      }
+    },
+    {
+      "name": "postedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      },
+      "doc": "When the ledger considers this transaction final. Compared against BankEvent.valueDate to compute settlementLagMs."
+    },
+    {
+      "name": "sourceSystem",
+      "type": "string",
+      "default": "LEDGER"
+    }
+  ]
+}

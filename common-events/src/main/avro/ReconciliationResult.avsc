@@ -1,0 +1,50 @@
+{
+  "type": "record",
+  "name": "ReconciliationResult",
+  "namespace": "com.recon.events",
+  "doc": "Emitted by reconciliation-engine to topic 'recon-results' whenever the matching rule chain resolves a transactionRef (see blueprint sec 5.2). Consumed by dashboard-api to update Redis. camelCase field names deliberately -- see LedgerEvent.avsc doc.",
+  "fields": [
+    {"name": "transactionRef", "type": "string"},
+    {
+      "name": "matchStatus",
+      "type": {
+        "type": "enum",
+        "name": "MatchStatus",
+        "symbols": ["MATCHED", "MATCHED_WITH_TOLERANCE", "SETTLEMENT_LAG_WARNING"]
+      },
+      "doc": "Only resolution outcomes that are NOT exceptions live here. Anything that fails matching goes to ExceptionEvent instead."
+    },
+    {
+      "name": "ledgerAmount",
+      "type": ["null", {"type": "bytes", "logicalType": "decimal", "precision": 18, "scale": 2}],
+      "default": null
+    },
+    {
+      "name": "pspAmount",
+      "type": ["null", {"type": "bytes", "logicalType": "decimal", "precision": 18, "scale": 2}],
+      "default": null
+    },
+    {
+      "name": "bankAmount",
+      "type": ["null", {"type": "bytes", "logicalType": "decimal", "precision": 18, "scale": 2}],
+      "default": null
+    },
+    {"name": "currency", "type": "string"},
+    {
+      "name": "settlementLagMs",
+      "type": ["null", "long"],
+      "default": null,
+      "doc": "postedAt (ledger) vs valueDate (bank), in milliseconds. Null if bank source hasn't arrived yet for a partial match."
+    },
+    {
+      "name": "matchedAt",
+      "type": {"type": "long", "logicalType": "timestamp-millis"}
+    },
+    {
+      "name": "matchVersion",
+      "type": "int",
+      "default": 1,
+      "doc": "Incremented if a late-arriving event causes re-evaluation of an already-resolved transactionRef (see LATE_ARRIVAL in the exception taxonomy)."
+    }
+  ]
+}

@@ -1,0 +1,146 @@
+name: payment-recon
+
+services:
+
+  # ---------------------------------------------------------------------
+  # Apache Kafka, single-node KRaft mode (no Zookeeper) - matches the
+  # architecture diagram exactly. combined broker+controller roles are
+  # fine for local dev; production would separate these.
+  # ---------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: recon-kafka
+    ports:
+      - "9092:9092"        # host-reachable listener, used by app code running on your machine
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:19092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # fixed cluster ID so `docker compose down/up` without -v keeps the same cluster identity
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # topics are created explicitly by kafka-init, see infra/kafka
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # a lightweight TCP-connect check, not a JVM invocation (kafka-broker-api-versions.sh
+      # spawns a full JVM per check, which under constrained Docker Desktop memory can itself
+      # start failing under load and flip the container to unhealthy after enough misses).
+      test: ["CMD-SHELL", "bash -c '(echo > /dev/tcp/localhost/19092) 2>/dev/null'"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+
+  # one-shot job: waits for kafka, then creates all topics from infra/kafka/create-topics.sh, then exits
+  kafka-init:
+    image: apache/kafka:3.8.0
+    container_name: recon-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./infra/kafka/create-topics.sh:/create-topics.sh
+    entrypoint: ["bash", "/create-topics.sh"]
+
+  # ---------------------------------------------------------------------
+  # Confluent Schema Registry - stores the Avro schemas defined in
+  # common-events, enforces BACKWARD compatibility on schema evolution.
+  # ---------------------------------------------------------------------
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    container_name: recon-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:19092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
+
+  # ---------------------------------------------------------------------
+  # Postgres - matched_transactions, exceptions, processed_events tables.
+  # See infra/postgres/init.sql for the schema (blueprint sec 7.1).
+  # ---------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: recon-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: recon
+      POSTGRES_USER: recon
+      POSTGRES_PASSWORD: recon
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recon -d recon"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # Redis - live status cache + dashboard metrics cache (blueprint sec 7.2)
+  # ---------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: recon-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # LocalStack - simulates S3 for the bank-file-ingester's file-drop
+  # source, so Phase 2 doesn't need real AWS credentials to develop against.
+  # ---------------------------------------------------------------------
+  localstack:
+    image: localstack/localstack:3.7
+    container_name: recon-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      DEFAULT_REGION: us-east-1
+      PERSISTENCE: 1
+    volumes:
+      - localstack-data:/var/lib/localstack
+
+  # ---------------------------------------------------------------------
+  # Kafka UI - optional but genuinely useful during development: browse
+  # topics, inspect messages, watch consumer group lag in a browser.
+  # ---------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: recon-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+
+volumes:
+  kafka-data:
+  postgres-data:
+  localstack-data:

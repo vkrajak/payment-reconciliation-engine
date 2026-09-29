@@ -1,0 +1,35 @@
+server:
+  port: 8093
+
+spring:
+  application:
+    name: bank-file-ingester
+  kafka:
+    bootstrap-servers: localhost:9092
+    properties:
+      schema.registry.url: http://localhost:8081
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+sim:
+  bank:
+    bank-events-topic: bank-events
+    scenario-topic: sim-scenarios
+    consumer-group-id: bank-file-ingester
+
+    s3-bucket: bank-statements
+    s3-endpoint: http://localhost:4566   # LocalStack; see S3Config doc for how this changes in prod
+    s3-region: us-east-1
+    s3-access-key: test                  # LocalStack accepts any non-empty creds
+    s3-secret-key: test
+    statement-key-prefix: statements/
+
+    write-interval-ms: 10000   # StatementFileWriter: flush ready lines to a new S3 file every 10s
+    watch-interval-ms: 5000    # StatementFileWatcher: poll the bucket for new files every 5s

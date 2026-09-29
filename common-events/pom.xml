@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.recon</groupId>
+        <artifactId>payment-reconciliation-engine</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>common-events</artifactId>
+    <packaging>jar</packaging>
+    <name>common-events</name>
+    <description>
+        Avro schemas + generated POJOs for every event contract in the system
+        (LedgerEvent, PspEvent, BankEvent, ReconciliationResult, ExceptionEvent).
+        Every other module (simulators, reconciliation-engine, exception-classifier,
+        dashboard-api) depends on this as an internal artifact so producers and
+        consumers can never drift out of sync on the wire format.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.avro</groupId>
+            <artifactId>avro</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Generates Java POJOs from every .avsc under src/main/avro into target/generated-sources -->
+            <plugin>
+                <groupId>org.apache.avro</groupId>
+                <artifactId>avro-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>generate-avro-pojos</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>schema</goal>
+                        </goals>
+                        <configuration>
+                            <sourceDirectory>${project.basedir}/src/main/avro</sourceDirectory>
+                            <outputDirectory>${project.basedir}/target/generated-sources/avro</outputDirectory>
+                            <stringType>String</stringType>
+                            <!-- fieldVisibility PRIVATE forces getters/setters, matches JPA/Jackson expectations -->
+                            <fieldVisibility>PRIVATE</fieldVisibility>
+                            <!-- required so `decimal` logicalType fields generate as java.math.BigDecimal, not raw ByteBuffer -->
+                            <enableDecimalLogicalType>true</enableDecimalLogicalType>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,0 +1,72 @@
+{
+  "type": "record",
+  "name": "PspEvent",
+  "namespace": "com.recon.events",
+  "doc": "Emitted when the card processor / PSP confirms a transaction. Published to topic 'psp-events', keyed by transactionRef. camelCase field names deliberately -- see LedgerEvent.avsc doc.",
+  "fields": [
+    {
+      "name": "eventId",
+      "type": "string",
+      "doc": "UUID, idempotency key -- see LedgerEvent.eventId doc for the full explanation."
+    },
+    {
+      "name": "transactionRef",
+      "type": "string",
+      "doc": "Must match the same real-world transaction's ref in LedgerEvent and BankEvent."
+    },
+    {
+      "name": "accountId",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": {
+        "type": "bytes",
+        "logicalType": "decimal",
+        "precision": 18,
+        "scale": 2
+      },
+      "doc": "Gross amount as authorized by the PSP, BEFORE pspFee is deducted. Matching against LedgerEvent.amount uses this field, not the net amount."
+    },
+    {
+      "name": "currency",
+      "type": "string"
+    },
+    {
+      "name": "txnType",
+      "type": {
+        "type": "enum",
+        "name": "TxnType",
+        "symbols": ["DEBIT", "CREDIT"]
+      }
+    },
+    {
+      "name": "pspFee",
+      "type": {
+        "type": "bytes",
+        "logicalType": "decimal",
+        "precision": 18,
+        "scale": 2
+      },
+      "doc": "Processor fee, informational for v1. Hook point for a future FX/fee-adjusted matching rule (see blueprint sec 5.2, rule 2)."
+    },
+    {
+      "name": "authCode",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Card auth code if applicable. Nullable because not every rail produces one (e.g. bank-initiated transfers via a PSP wrapper)."
+    },
+    {
+      "name": "postedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    },
+    {
+      "name": "sourceSystem",
+      "type": "string",
+      "default": "PSP"
+    }
+  ]
+}

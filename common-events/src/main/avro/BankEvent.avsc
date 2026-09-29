@@ -1,0 +1,65 @@
+{
+  "type": "record",
+  "name": "BankEvent",
+  "namespace": "com.recon.events",
+  "doc": "Produced by bank-file-ingester after parsing one line of a bank statement CSV dropped in S3. Published to topic 'bank-events', keyed by transactionRef. This is the slowest, most delayed of the three sources -- design the matching window around this one. camelCase field names deliberately -- see LedgerEvent.avsc doc.",
+  "fields": [
+    {
+      "name": "eventId",
+      "type": "string",
+      "doc": "UUID, idempotency key. IMPORTANT: if the same statement file is re-processed (e.g. ingester restarted mid-file), eventId must be deterministically derived from statementLineId so re-ingestion doesn't create phantom duplicate events -- see StatementFileWatcher."
+    },
+    {
+      "name": "transactionRef",
+      "type": "string"
+    },
+    {
+      "name": "accountId",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": {
+        "type": "bytes",
+        "logicalType": "decimal",
+        "precision": 18,
+        "scale": 2
+      }
+    },
+    {
+      "name": "currency",
+      "type": "string"
+    },
+    {
+      "name": "txnType",
+      "type": {
+        "type": "enum",
+        "name": "TxnType",
+        "symbols": ["DEBIT", "CREDIT"]
+      }
+    },
+    {
+      "name": "statementLineId",
+      "type": "string",
+      "doc": "Bank's own line-item identifier from the statement file. Used for the deterministic eventId derivation and for audit trail back to the source file."
+    },
+    {
+      "name": "valueDate",
+      "type": {
+        "type": "int",
+        "logicalType": "date"
+      },
+      "doc": "The bank's settlement date for this line, date-only (no time component -- this is how bank statements report it). Compared against LedgerEvent.postedAt to compute settlementLagMs."
+    },
+    {
+      "name": "sourceFile",
+      "type": "string",
+      "doc": "S3 key of the statement file this line came from, for audit/traceability."
+    },
+    {
+      "name": "sourceSystem",
+      "type": "string",
+      "default": "BANK"
+    }
+  ]
+}

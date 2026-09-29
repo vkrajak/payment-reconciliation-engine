@@ -1,0 +1,49 @@
+{
+  "type": "record",
+  "name": "ExceptionEvent",
+  "namespace": "com.recon.events",
+  "doc": "Emitted by reconciliation-engine to topic 'exception-events' when the matching rule chain cannot resolve a transactionRef cleanly (see blueprint sec 6). Consumed by exception-classifier. NOTE: BUSINESS exception, not a technical failure -- technical failures go to .DLT topics instead. camelCase field names deliberately -- see LedgerEvent.avsc doc.",
+  "fields": [
+    {"name": "transactionRef", "type": "string"},
+    {
+      "name": "exceptionCode",
+      "type": {
+        "type": "enum",
+        "name": "ExceptionCode",
+        "symbols": [
+          "MISSING_SOURCE",
+          "AMOUNT_MISMATCH",
+          "CURRENCY_MISMATCH",
+          "DUPLICATE_TRANSACTION_REF",
+          "ORPHAN_EVENT",
+          "LATE_ARRIVAL"
+        ]
+      }
+    },
+    {
+      "name": "sourcesPresent",
+      "type": {"type": "array", "items": "string"},
+      "doc": "Which of LEDGER / PSP / BANK had actually arrived when this exception was raised."
+    },
+    {
+      "name": "rawLedgerEvent",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "JSON-serialized snapshot of the raw LedgerEvent if present, for audit/drill-down. Stored as a string to avoid circular schema dependencies between these five schemas."
+    },
+    {
+      "name": "rawPspEvent",
+      "type": ["null", "string"],
+      "default": null
+    },
+    {
+      "name": "rawBankEvent",
+      "type": ["null", "string"],
+      "default": null
+    },
+    {
+      "name": "detectedAt",
+      "type": {"type": "long", "logicalType": "timestamp-millis"}
+    }
+  ]
+}

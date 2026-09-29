@@ -1,0 +1,38 @@
+server:
+  port: 8091
+
+spring:
+  application:
+    name: ledger-simulator
+  kafka:
+    bootstrap-servers: localhost:9092
+    properties:
+      schema.registry.url: http://localhost:8081
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+# --- simulator-specific config, all overridable via env vars for docker/k8s ---
+sim:
+  ledger:
+    topic: ledger-events
+    scenario-topic: sim-scenarios
+    # how many simulated transactions to generate per scheduler tick
+    txns-per-tick: 10
+    # delay between ticks
+    tick-interval-ms: 3000
+    # scenario probability weights (must sum to 100) -- see ScenarioFactory
+    weights:
+      happy-path: 80
+      amount-mismatch: 5
+      missing-psp: 3
+      missing-bank: 4
+      duplicate-psp: 3
+      duplicate-bank: 2
+      delayed-bank: 3
