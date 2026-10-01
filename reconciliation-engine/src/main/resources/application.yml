@@ -1,0 +1,39 @@
+server:
+  port: 8094
+
+spring:
+  application:
+    name: reconciliation-engine
+  kafka:
+    bootstrap-servers: localhost:9092
+    properties:
+      schema.registry.url: http://localhost:8081
+  datasource:
+    url: jdbc:postgresql://localhost:5432/recon
+    username: recon
+    password: recon
+    driver-class-name: org.postgresql.Driver
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+recon:
+  engine:
+    application-id: reconciliation-engine
+    ledger-topic: ledger-events
+    psp-topic: psp-events
+    bank-topic: bank-events
+    recon-results-topic: recon-results
+    state-store-name: reconciliation-state-store
+
+    session-window-minutes: 30    # blueprint sec 5.1
+    session-grace-minutes: 5      # how long after inactivity Streams still accepts a late-arriving event
+
+    tolerance-amount: 0.01        # blueprint sec 5.2 rule 2 -- max |amount diff| still considered a match
+    settlement-lag-warning-threshold-ms: 86400000   # 24h -- blueprint sec 5.2 rule 3
