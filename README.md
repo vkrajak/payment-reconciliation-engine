@@ -216,9 +216,79 @@ mvn -pl bank-file-ingester spring-boot:run
 - No dead-letter handling yet in the simulators themselves — that pattern is
   introduced properly in Phase 3's reconciliation-engine.
 
+## Phase 3 — `reconciliation-engine` (happy-path matching only)
+
+The core of the system: a Kafka Streams topology that performs the 3-way
+join across `ledger-events` / `psp-events` / `bank-events`, runs the
+matching rule chain, and persists MATCHED outcomes to Postgres.
+
+**Scope note:** this phase deliberately excludes three things that look
+related but are separate roadmap items — the `processed_events`
+idempotency-key check (Phase 4), exception classification + DLQ wiring for
+transactions that *don't* match (Phase 5), and Redis caching (Phase 6). A
+transaction that fails to match in this phase is logged and dropped, not
+routed anywhere yet.
+
+### How the topology works
+A `SessionWindows` aggregation (not a chained two-way join) was used
+specifically because it naturally models the blueprint's
+`PENDING → PARTIALLY_MATCHED → MATCHED` state machine per `transactionRef` —
+every new event just updates the aggregate in place, and the rule chain only
+ever fires once the aggregate is complete.
+
+### A design clarification worth knowing
+
+Blueprint §5.2 describes three "rules", but rule 3 (settlement-lag /
+timing-only mismatch) isn't a third competing strategy the way rules 1 and 2
+are — it's a **modifier** applied on top of whichever of rules 1/2 already
+matched, downgrading the status to `SETTLEMENT_LAG_WARNING`. It's
+implemented as a post-processing step in `MatchRuleChain`, not as a third
+`MatchRule` bean, with the reasoning written directly in that class's doc
+comment.
+
+### New Maven module
+
+| Module | Type | Depends on |
+|---|---|---|
+| `reconciliation-engine` | Spring Boot app (Kafka Streams + JDBC) | `common-events` |
+
+Add to root `pom.xml`'s `<modules>` list:
+```xml
+<module>reconciliation-engine</module>
+```
+
+### Run it
+
+```bash
+# infra (Phase 0) and at least one simulator (Phase 2) should already be running
+mvn clean install
+mvn -pl reconciliation-engine spring-boot:run
+```
+
+### Verify it's working
+
+| Check | How |
+|---|---|
+| Topology started cleanly | Logs show `"Reconciliation topology built: ..."` on startup |
+| Results flowing | Kafka UI (http://localhost:8080) → `recon-results` topic → Avro `ReconciliationResult` messages |
+| Rows landing in Postgres | `docker exec -it recon-postgres psql -U recon -d recon -c "SELECT transaction_ref, match_status, currency, settlement_lag_ms FROM matched_transactions ORDER BY matched_at DESC LIMIT 10;"` |
+| Non-matches visible (expected, not a bug) | Logs show `WARN ... failed to match ... would raise AMOUNT_MISMATCH or CURRENCY_MISMATCH in Phase 5, dropped for now` whenever a simulator deliberately produced a mismatch scenario |
+| Rows landing in the right partition | Since "today" is outside the dated partitions seeded in Phase 0's `init.sql` (2026-09-15/16/17), rows land in `matched_transactions_default` — check there too, this is expected, not an error |
+
+### Known Phase 3 limitations (intentional, not deferred silently)
+
+- No idempotency-key check against `processed_events` — only a bare
+  `ON CONFLICT (transaction_ref, match_version, business_date) DO NOTHING`
+  as a crash-safety net. It silently no-ops a duplicate write but doesn't
+  *detect or log* that one occurred, which blueprint §4.3's full design
+  calls for. Phase 4 replaces this.
+- Failed matches (currency mismatch, amount beyond tolerance) are logged
+  and dropped — no `ExceptionEvent` is published yet. Phase 5.
+- No Redis cache population yet. Phase 6.
+
 ## What's next
 
-Phase 3: `reconciliation-engine` — the Kafka Streams topology that actually
-performs the 3-way join, runs the matching rule chain, and writes to
-`matched_transactions` / `exceptions` with the idempotency guarantees from
-blueprint §4.3. Say the word when you're ready.
+Phase 4: idempotency-key layer (`processed_events` table, proper
+check-and-insert in the same transaction as the business write) — or Phase
+5: exception classification + DLQ wiring, whichever you want to tackle
+first. Say the word.

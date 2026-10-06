@@ -99,6 +99,7 @@
         <module>ledger-simulator</module>
         <module>psp-simulator</module>
         <module>bank-file-ingester</module>
+        <module>reconciliation-engine</module>
     </modules>
 
     <build>
