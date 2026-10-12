@@ -89,6 +89,20 @@
             <artifactId>kafka-streams-test-utils</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!-- PHASE 4: real Postgres for the idempotency test (sink/MatchedResultListenerIdempotencyTest).
+             Versions are managed transitively via Spring Boot's own
+             testcontainers-bom import, no explicit version needed here. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

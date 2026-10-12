@@ -30,6 +30,7 @@ recon:
     psp-topic: psp-events
     bank-topic: bank-events
     recon-results-topic: recon-results
+    exception-events-topic: exception-events   # PHASE 5
     state-store-name: reconciliation-state-store
 
     session-window-minutes: 30    # blueprint sec 5.1

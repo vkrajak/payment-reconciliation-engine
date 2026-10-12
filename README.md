@@ -289,6 +289,233 @@ mvn -pl reconciliation-engine spring-boot:run
 ## What's next
 
 Phase 4: idempotency-key layer (`processed_events` table, proper
-check-and-insert in the same transaction as the business write) — or Phase
-5: exception classification + DLQ wiring, whichever you want to tackle
-first. Say the word.
+check-and-insert in the same transaction as the business write)
+
+# exception-classifier
+
+Phase 5 of the Real-Time Payment Reconciliation & Exception Engine.
+
+Consumes **exception candidates** from `reconciliation-engine`, decides *why* each transaction failed to reconcile
+(amount mismatch, missing source, etc.), and persists a fully auditable row to Postgres for ops triage.
+It also owns the **dead-letter path**: technical failures are captured in a separate table and alerted on,
+never mixed with business exceptions and never silently dropped.
+
+## Where it sits
+
+```
+reconciliation-engine ──► exception-events (3 partitions, key = transaction_ref)
+                                │
+                                ▼
+                       ┌──────────────────┐   ok     ┌────────────────────────┐
+                       │ ExceptionCandidate│────────►│ exceptions (Postgres)   │──► dashboard-api (Phase 6)
+                       │ Listener          │         └────────────────────────┘
+                       │  validate         │
+                       │  classify (rules) │   fails 3x (1s/2s/4s) or malformed
+                       │  persist (1 txn)  │──────────────┐
+                       └──────────────────┘              ▼
+                                                  exception-events.DLT
+                                                         │
+                                                         ▼
+                                              ┌──────────────────┐     ┌──────────────────────┐
+                                              │ DeadLetterListener│───►│ dead_letter_events   │──► alert
+                                              │ (raw bytes)       │     └──────────────────────┘
+                                              └──────────────────┘
+
+OrphanSweepJob (scheduled): MISSING_SOURCE with no LEDGER, older than grace ──► ORPHAN_EVENT
+```
+
+**Exception queue vs. DLQ:** business exceptions are expected operational noise and go to ops via the dashboard.
+DLQ records are technical failures (poison pills, DB outages) and go to engineering. See
+[ADR 007](../docs/adr/007-exception-queue-vs-dlq.md).
+
+## Event contract
+
+Topic `exception-events`, key = `transactionRef`, JSON value (`com.recon.events.exception.ExceptionCandidate`):
+
+```json
+{
+  "candidateId": "c-001",
+  "transactionRef": "TXN-1001",
+  "trigger": "WINDOW_EXPIRED",
+  "firstEventAt": "2026-10-06T10:00:00Z",
+  "detectedAt":   "2026-10-06T10:30:00Z",
+  "events": [
+    { "source": "LEDGER", "eventId": "e1", "amount": 100.00, "currency": "INR",
+      "occurredAt": "2026-10-06T10:00:00Z", "raw": {} }
+  ],
+  "priorResolution": null
+}
+```
+
+| Field | Notes |
+|---|---|
+| `candidateId` | **Must be deterministic** for the same underlying state (the engine's `ExceptionCandidateFactory` does this). It is the idempotency key. |
+| `trigger` | `WINDOW_EXPIRED`, `SOURCES_DISAGREE`, `DUPLICATE_REF`, `POST_RESOLUTION_EVENT`. A hint only: the classifier re-derives the code from `events`. |
+| `events` | Snapshots of every source event relevant to the candidate. For `POST_RESOLUTION_EVENT`, only the late event(s). |
+| `priorResolution` | `MATCHED` or `EXCEPTION`; only for late arrivals. |
+
+## Classification rules
+
+Ordered, first match wins (`@Order`). Each rule is a `ClassificationRule` bean, unit-tested in isolation.
+
+| Order | Rule | Code | Fires when |
+|---|---|---|---|
+| 10 | `LateArrivalRule` | `LATE_ARRIVAL` | trigger is `POST_RESOLUTION_EVENT` |
+| 20 | `DuplicateTransactionRefRule` | `DUPLICATE_TRANSACTION_REF` | same source has 2+ distinct `eventId`s, or trigger is `DUPLICATE_REF` |
+| 30 | `CurrencyMismatchRule` | `CURRENCY_MISMATCH` | more than one distinct currency across sources (checked before amounts) |
+| 40 | `AmountMismatchRule` | `AMOUNT_MISMATCH` | 2+ sources and max-min amount delta is greater than `tolerance` |
+| 50 | `OrphanEventRule` | `ORPHAN_EVENT` | window expired, no `LEDGER`, and age is at least `window + orphan-grace` |
+| 60 | `MissingSourceRule` | `MISSING_SOURCE` | fewer than 3 sources present |
+| fallback | | `UNCLASSIFIED` | nothing matched (alerts engineering; never dropped) |
+
+Behaviours worth knowing:
+
+- **Orphans are two-step.** At window expiry a candidate with no ledger is first `MISSING_SOURCE`.
+  `OrphanSweepJob` upgrades it to `ORPHAN_EVENT` once `orphan-grace` has passed since detection.
+- **Late arrivals** are stored as their own `LATE_ARRIVAL` row *and* folded (events + sources) into the most recent
+  non-resolved exception for that ref. The append only happens on first insert, so redelivery cannot double-append.
+- **Tolerance:** a delta within tolerance is not an exception. If the engine emitted such a candidate, it falls to
+  `UNCLASSIFIED`, which means the engine and classifier tolerances are out of sync.
+- **Audit:** every row stores `rule_name` and `classification_detail` (what was compared), answering "why did the
+  system say this?".
+
+## Data model
+
+Defined in `src/main/resources/db/migration/V5__exceptions_and_dead_letters.sql`.
+
+- `exceptions`: one row per candidate. Unique on `candidate_id`. Status `OPEN` / `ACKNOWLEDGED` / `RESOLVED`.
+  `sources_present` is a JSON array like `["LEDGER","PSP"]`; `raw_events` is a JSON array of event snapshots.
+- `dead_letter_events`: unique on `(source_topic, source_partition, source_offset)`; keeps the raw payload (`BYTEA`),
+  exception class, message and stacktrace. Status `OPEN` / `REPLAYED` / `DISCARDED`.
+
+> If your Flyway migrations live in another module, move the file there and renumber if `V5` is taken.
+> This module does not run Flyway itself.
+
+## Delivery & idempotency guarantees
+
+- At-least-once consumption, record-level offset commits (`ack-mode: record`).
+- Classify + insert run in **one DB transaction**; the offset is committed after it succeeds.
+- Redelivery is a no-op via `INSERT ... ON CONFLICT (candidate_id) DO NOTHING`.
+- Result: effectively-once persistence; one candidate yields at most one `exceptions` row.
+
+## DLQ behaviour
+
+| Failure | Behaviour |
+|---|---|
+| Undeserialisable payload (poison pill) | Straight to `exception-events.DLT`, no retries |
+| `MalformedCandidateException` (missing required fields) | Straight to DLT, no retries |
+| Any other processing error (e.g. DB hiccup) | Retry 3x with exponential backoff (1s, 2s, 4s), then DLT |
+| Persisting a DLT record fails | Consumer stalls and retries forever (it will not skip a DLT record) |
+
+The DLT consumer never deserialises the payload, so a poison pill cannot fail twice. To capture other services'
+DLTs, change the listener to a topic list or `topicPattern = ".*\\.DLT"`.
+
+**Reprocessing a dead letter:** fix the cause, then republish the `payload` from `dead_letter_events` to
+`exception-events` and set the row's `status` to `REPLAYED`. There is no automated replay tool in v1.
+
+## Configuration
+
+`src/main/resources/application.yml`. Environment variables override the defaults.
+
+| Property / env var | Default | Purpose |
+|---|---|---|
+| `KAFKA_BOOTSTRAP` | `localhost:9092` | Broker address |
+| `DB_URL` / `DB_USER` / `DB_PASSWORD` | `jdbc:postgresql://localhost:5432/recon` / `recon` / `recon` | Postgres |
+| `recon.kafka.exception-topic` | `exception-events` | Input topic (auto-created, 3 partitions, 90d retention) |
+| `recon.kafka.dlt-topic` | `exception-events.DLT` | Dead-letter topic (3 partitions, must be >= source partitions) |
+| `recon.kafka.replicas` | `1` | Topic replication factor; use 3 outside local dev |
+| `recon.classifier.tolerance` | `0.01` | **Must equal the engine's tolerance** |
+| `recon.classifier.window` | `30m` | Engine session window (used by `OrphanEventRule`) |
+| `recon.classifier.orphan-grace` | `30m` | Wait after detection before `MISSING_SOURCE` becomes `ORPHAN_EVENT` |
+| `recon.classifier.sweep-interval-ms` | `60000` | How often `OrphanSweepJob` runs |
+| `server.port` | `8085` | Actuator / health / metrics |
+
+## Run locally
+
+```bash
+# infra (Kafka/Redpanda + Postgres) from your existing docker-compose, with V5 applied to the DB
+mvn -pl exception-classifier -am spring-boot:run
+```
+
+Or in Docker (build context is the repo root):
+
+```bash
+docker build -f exception-classifier/Dockerfile -t exception-classifier .
+```
+
+A ready-to-merge compose service is in `docker-compose.exception-classifier.snippet.yml`.
+
+### Smoke test
+
+```bash
+# 1. A candidate: should classify as MISSING_SOURCE (missing BANK)
+echo '{"candidateId":"c-001","transactionRef":"TXN-1001","trigger":"WINDOW_EXPIRED","firstEventAt":"2026-10-06T10:00:00Z","detectedAt":"2026-10-06T10:30:00Z","events":[{"source":"LEDGER","eventId":"e1","amount":100.00,"currency":"INR","occurredAt":"2026-10-06T10:00:00Z"},{"source":"PSP","eventId":"e2","amount":100.00,"currency":"INR","occurredAt":"2026-10-06T10:00:02Z"}]}' \
+  | rpk topic produce exception-events -k TXN-1001
+
+psql -c "SELECT transaction_ref, exception_code, rule_name, classification_detail FROM exceptions;"
+
+# 2. Idempotency: publish the same message again, count must stay 1
+psql -c "SELECT count(*) FROM exceptions;"
+
+# 3. Poison pill: after ~7s a row appears in dead_letter_events
+echo 'not json' | rpk topic produce exception-events
+psql -c "SELECT source_topic, source_offset, exception_class FROM dead_letter_events;"
+```
+
+## Tests
+
+```bash
+mvn -pl exception-classifier test      # ClassificationChainTest (pure unit tests, no infra)
+mvn -pl exception-classifier verify    # also runs ExceptionServiceIdempotencyIT (Testcontainers Postgres; needs Docker)
+```
+
+- `ClassificationChainTest`: one test per rule, including currency-before-amount ordering, tolerance boundary, and
+  the orphan threshold.
+- `ExceptionServiceIdempotencyIT`: a redelivered candidate is stored once; a redelivered late arrival is appended once.
+
+## Observability
+
+Scrape `http://localhost:8085/actuator/prometheus`. Health probes at `/actuator/health/liveness` and `/readiness`.
+
+| Metric | Meaning |
+|---|---|
+| `recon_exceptions_total{exception_code}` | New exceptions persisted, by code |
+| `recon_dlq_total{service}` | Dead letters persisted (alert on any increase) |
+| `recon_orphan_upgrades_total` | `MISSING_SOURCE` rows upgraded to `ORPHAN_EVENT` |
+
+Alert rules are in `monitoring/alerts/recon-exceptions.yml`: DLQ activity, any `UNCLASSIFIED`, and exception rate
+above 5% of volume.
+
+## Scaling & operations
+
+- Run **at most 3 replicas** (the topic has 3 partitions); extra pods sit idle.
+- Safe to run several replicas: inserts are idempotent and the orphan sweep is an idempotent `UPDATE`.
+- Redis is not used by this module; Phase 6 adds caching on the read side.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| Rows with `UNCLASSIFIED` | Engine and classifier `tolerance` differ, or the engine emitted a candidate no rule covers |
+| Everything goes to the DLT | Wrong deserializer config or producer sending a different shape; check `exception_message` in `dead_letter_events` |
+| Nothing consumed | Check consumer group `exception-classifier` lag; confirm the topic exists and `KAFKA_BOOTSTRAP` is reachable |
+| Many `ORPHAN_EVENT`s | Ledger feed is down or delayed beyond `window + orphan-grace` |
+| DLT consumer stalled | Postgres unreachable; it retries indefinitely by design |
+
+## Package layout
+
+```
+com.recon.classifier
+├── config/        ClassifierProperties, KafkaConfig (topics, error handler, DLT recoverer, DLT consumer factory)
+├── consumer/      ExceptionCandidateListener, DeadLetterListener
+├── rules/         ClassificationRule, ClassificationChain, one class per rule
+├── service/       ExceptionService (classify + persist, one txn), MalformedCandidateException
+├── persistence/   ExceptionRepository, DeadLetterRepository (JdbcTemplate, ON CONFLICT)
+└── job/           OrphanSweepJob
+```
+
+## Adding a new exception code
+
+1. Add the value to `ExceptionCode` (in `common-events`).
+2. Create a `ClassificationRule` bean with an `@Order` that places it correctly in the chain.
+3. Add a case to `ClassificationChainTest` (and to the chain list in `ExceptionServiceIdempotencyIT` if relevant).

@@ -48,7 +48,15 @@ public class MatchRuleChain {
         for (MatchRule rule : rules) {
             Optional<MatchOutcome> outcome = rule.apply(state);
             if (outcome.isPresent()) {
-                return Optional.of(applySettlementLagCheck(outcome.get(), state));
+                MatchOutcome withLag = applySettlementLagCheck(outcome.get(), state);
+                // PHASE 4: attach the three source event_ids for audit traceability --
+                // state is already in scope here, so this is the one place that needs
+                // to know about it; MatchRule implementations stay focused on amounts only.
+                MatchOutcome withAudit = withLag
+                        .withLedgerEventId(state.getLedger().getEventId())
+                        .withPspEventId(state.getPsp().getEventId())
+                        .withBankEventId(state.getBank().getEventId());
+                return Optional.of(withAudit);
             }
         }
         return Optional.empty();

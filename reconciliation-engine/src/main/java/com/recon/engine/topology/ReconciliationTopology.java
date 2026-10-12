@@ -1,13 +1,17 @@
 package com.recon.engine.topology;
 
 import com.recon.engine.config.EngineProperties;
+import com.recon.engine.model.ExceptionOutcome;
 import com.recon.engine.model.MatchOutcome;
 import com.recon.engine.model.ReconciliationState;
 import com.recon.engine.model.SourceEventEnvelope;
 import com.recon.engine.model.SourceType;
+import com.recon.engine.rules.ExceptionClassifier;
 import com.recon.engine.rules.MatchRuleChain;
 import com.recon.engine.serde.JacksonSerde;
 import com.recon.events.BankEvent;
+import com.recon.events.ExceptionCode;
+import com.recon.events.ExceptionEvent;
 import com.recon.events.LedgerEvent;
 import com.recon.events.MatchStatus;
 import com.recon.events.PspEvent;
@@ -28,32 +32,51 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
- * Builds the full Phase 3 topology onto the shared {@link StreamsBuilder}
- * that spring-kafka's @EnableKafkaStreams infrastructure provides and
- * manages the lifecycle of (see config.KafkaStreamsConfig doc). The build
- * happens once, in {@link #buildTopology()}, called from a
- * {@code @PostConstruct} so it runs during context startup before the
- * factory bean starts the actual KafkaStreams client.
+ * Builds the full topology onto the shared {@link StreamsBuilder} that
+ * spring-kafka's @EnableKafkaStreams infrastructure provides and manages the
+ * lifecycle of (see config.KafkaStreamsConfig doc). The build happens once,
+ * in {@link #buildTopology()}, called from a {@code @PostConstruct} so it
+ * runs during context startup before the factory bean starts the actual
+ * KafkaStreams client.
  * <p>
- * Shape of the pipeline:
+ * Shape of the pipeline (PHASE 5: now three terminal branches, not one):
  * <pre>
  *   ledger-events (Avro) --\
  *   psp-events    (Avro) ---+--> map to SourceEventEnvelope --> merge -->
  *   bank-events   (Avro) --/
  *
  *   groupByKey().windowedBy(SessionWindows) .aggregate(...)   [3-way join, blueprint sec 5.1]
- *     --> KTable<Windowed<String>, ReconciliationState>
- *     --> toStream().selectKey(drop window wrapper)
- *     --> filter(state.isComplete())
- *     --> mapValues(MatchRuleChain::evaluate)                 [blueprint sec 5.2]
- *     --> filter(present) .mapValues(Optional::get)
- *     --> map to Avro ReconciliationResult
- *     --> to(recon-results)
+ *     --> KTable<Windowed<String>, ReconciliationState>  ("aggregated")
+ *          |
+ *          |-- (A) toStream(), UNSUPPRESSED -- fires the instant the aggregate changes --
+ *          |     "resolved"
+ *          |     |
+ *          |     |-- A1: filter(conflict present) --------------------------------+
+ *          |     |     classifyConflict -> DUPLICATE_TRANSACTION_REF / LATE_ARRIVAL |
+ *          |     |                                                                  |
+ *          |     |-- A2: filter(complete && no conflict)                            |
+ *          |           mapValues(evaluate rule chain) -> MatchAttempt               |
+ *          |           |-- outcome present -> recon-results (MATCHED family)        |
+ *          |           |-- outcome empty -> classifyMismatch -> AMOUNT/CURRENCY_MISMATCH
+ *          |                                                                        |
+ *          |-- (B) suppress(untilWindowCloses).toStream() -- fires once per key,    |
+ *                when the session window actually closes --                        |
+ *                filter(!complete && no conflict)                                   |
+ *                classifyIncomplete -> MISSING_SOURCE / ORPHAN_EVENT                |
+ *                                                                                    |
+ *                                                                        all exception outcomes
+ *                                                                        --> exception-events
  * </pre>
- * Incomplete or non-matching states are filtered out and logged, not routed
- * anywhere -- Phase 5 adds the exception-event branch here.
+ * Branch (A) resolves MATCHED/mismatch/conflict outcomes as early as possible
+ * (no reason to wait for window close once we already know the answer).
+ * Branch (B) exists ONLY to catch the "never became complete, and never had
+ * a conflict either" case, which by definition can only be known once the
+ * session window has genuinely closed -- see blueprint sec 5.1's state
+ * machine and this class's git history (Phase 3 deliberately had no (B) at
+ * all, since it only ever needed early resolution).
  */
 @Slf4j
 @Component
@@ -62,15 +85,18 @@ public class ReconciliationTopology {
     private final StreamsBuilder streamsBuilder;
     private final EngineProperties properties;
     private final MatchRuleChain matchRuleChain;
+    private final ExceptionClassifier exceptionClassifier;
     private final String schemaRegistryUrl;
 
     public ReconciliationTopology(StreamsBuilder streamsBuilder,
                                    EngineProperties properties,
                                    MatchRuleChain matchRuleChain,
+                                   ExceptionClassifier exceptionClassifier,
                                    org.springframework.core.env.Environment env) {
         this.streamsBuilder = streamsBuilder;
         this.properties = properties;
         this.matchRuleChain = matchRuleChain;
+        this.exceptionClassifier = exceptionClassifier;
         this.schemaRegistryUrl = env.getProperty("spring.kafka.properties.schema.registry.url");
     }
 
@@ -80,6 +106,7 @@ public class ReconciliationTopology {
         SpecificAvroSerde<PspEvent> pspSerde = avroSerde();
         SpecificAvroSerde<BankEvent> bankSerde = avroSerde();
         SpecificAvroSerde<ReconciliationResult> resultSerde = avroSerde();
+        SpecificAvroSerde<ExceptionEvent> exceptionSerde = avroSerde();
 
         KStream<String, SourceEventEnvelope> ledgerEnvelopes = streamsBuilder
                 .stream(properties.getLedgerTopic(), Consumed.with(Serdes.String(), ledgerSerde))
@@ -111,34 +138,71 @@ public class ReconciliationTopology {
                                 .withValueSerde(stateSerde)
                 );
 
-        aggregated
+        // ---------- Branch A: unsuppressed, early resolution ----------
+        KStream<String, ReconciliationState> resolved = aggregated
                 .toStream()
-                .selectKey((windowedKey, state) -> windowedKey.key())
-                .filter((transactionRef, state) -> {
-                    boolean complete = state != null && state.isComplete();
-                    if (!complete) {
-                        log.debug("txn_ref={} not yet complete, waiting for more sources", transactionRef);
-                    }
-                    return complete;
-                })
+                .selectKey((windowedKey, state) -> windowedKey.key());
+
+        // A1: conflict detected (duplicate second event for a source) -- fires
+        // immediately regardless of completeness, see class doc.
+        resolved.filter((transactionRef, state) -> state != null && state.getConflict() != null)
                 .mapValues((transactionRef, state) -> {
-                    Optional<MatchOutcome> outcome = matchRuleChain.evaluate(state);
-                    if (outcome.isEmpty()) {
-                        // Phase 3 has no exception path yet -- see class doc / Phase 5.
-                        log.warn("txn_ref={} failed to match (amount/currency mismatch beyond tolerance) -- " +
-                                "would raise AMOUNT_MISMATCH or CURRENCY_MISMATCH in Phase 5, dropped for now", transactionRef);
-                    }
-                    return outcome;
+                    log.warn("txn_ref={} CONFLICT detected on source={}: existing eventId={} vs new eventId={} (afterComplete={})",
+                            transactionRef, state.getConflict().getSource(), state.getConflict().getExistingEventId(),
+                            state.getConflict().getNewEventId(), state.getConflict().isDetectedAfterComplete());
+                    return exceptionClassifier.classifyConflict(state);
                 })
-                .filter((transactionRef, outcome) -> outcome.isPresent())
-                .mapValues(Optional::get)
+                .map((transactionRef, outcome) -> KeyValue.pair(transactionRef, toAvroException(transactionRef, outcome)))
+                .to(properties.getExceptionEventsTopic(), Produced.with(Serdes.String(), exceptionSerde));
+
+        // A2: complete and no conflict -> the actual matching rule chain
+        KStream<String, MatchAttempt> attempts = resolved
+                .filter((transactionRef, state) -> state != null && state.isComplete() && state.getConflict() == null)
+                .mapValues((transactionRef, state) -> new MatchAttempt(state, matchRuleChain.evaluate(state)));
+
+        attempts.filter((transactionRef, attempt) -> attempt.outcome().isPresent())
+                .mapValues(attempt -> attempt.outcome().get())
                 .map((transactionRef, outcome) -> KeyValue.pair(transactionRef, toAvroResult(transactionRef, outcome)))
                 .to(properties.getReconResultsTopic(), Produced.with(Serdes.String(), resultSerde));
 
-        log.info("Reconciliation topology built: {} -> session-join -> rule chain -> {}",
+        attempts.filter((transactionRef, attempt) -> attempt.outcome().isEmpty())
+                .mapValues(attempt -> {
+                    log.info("txn_ref={} failed to match (amount/currency mismatch beyond tolerance), classifying exception",
+                            attempt.state().getTransactionRef());
+                    return exceptionClassifier.classifyMismatch(attempt.state());
+                })
+                .map((transactionRef, outcome) -> KeyValue.pair(transactionRef, toAvroException(transactionRef, outcome)))
+                .to(properties.getExceptionEventsTopic(), Produced.with(Serdes.String(), exceptionSerde));
+
+        // ---------- Branch B: suppressed until window close ----------
+        // Only reachable here if the window closed WITHOUT ever becoming complete
+        // and WITHOUT a conflict (conflicts are already handled by A1, regardless
+        // of whether the transaction ever completes -- see class doc on why this
+        // phase reports at most one exception per transaction rather than layering
+        // MISSING_SOURCE on top of an already-reported conflict).
+        aggregated
+                .suppress(Suppressed.untilWindowCloses(Suppressed.BufferConfig.unbounded()))
+                .toStream()
+                .selectKey((windowedKey, state) -> windowedKey.key())
+                .filter((transactionRef, state) -> state != null && !state.isComplete() && state.getConflict() == null)
+                .mapValues(state -> {
+                    log.info("txn_ref={} session window closed incomplete, sources_present={}",
+                            state.getTransactionRef(), state.sourcesPresent());
+                    return exceptionClassifier.classifyIncomplete(state);
+                })
+                .map((transactionRef, outcome) -> KeyValue.pair(transactionRef, toAvroException(transactionRef, outcome)))
+                .to(properties.getExceptionEventsTopic(), Produced.with(Serdes.String(), exceptionSerde));
+
+        log.info("Reconciliation topology built: {} -> session-join -> [match chain | exception classifier] -> {} / {}",
                 String.join(", ", properties.getLedgerTopic(), properties.getPspTopic(), properties.getBankTopic()),
-                properties.getReconResultsTopic());
+                properties.getReconResultsTopic(), properties.getExceptionEventsTopic());
     }
+
+    /** Tiny carrier so the rule-chain evaluation (which needs both the original
+     *  state and its outcome) only runs once per record, with the two possible
+     *  downstream paths (matched vs. mismatch-exception) branching off the same
+     *  computed result rather than each re-evaluating the chain independently. */
+    private record MatchAttempt(ReconciliationState state, Optional<MatchOutcome> outcome) {}
 
     private <T extends org.apache.avro.specific.SpecificRecord> SpecificAvroSerde<T> avroSerde() {
         SpecificAvroSerde<T> serde = new SpecificAvroSerde<>();
@@ -209,6 +273,36 @@ public class ReconciliationTopology {
                 .setSettlementLagMs(outcome.getSettlementLagMs())
                 .setMatchedAt(Instant.now())
                 .setMatchVersion(1)
+                // PHASE 4: resultId is a fresh UUID per emitted result -- see
+                // MatchedResultListener's class doc for the full idempotency rationale.
+                .setResultId(UUID.randomUUID().toString())
+                .setLedgerEventId(outcome.getLedgerEventId())
+                .setPspEventId(outcome.getPspEventId())
+                .setBankEventId(outcome.getBankEventId())
+                .build();
+    }
+
+    /** Same resultId pattern as toAvroResult, mirrored for exceptions -- see
+     *  ExceptionEvent.avsc's resultId field doc. */
+    private ExceptionEvent toAvroException(String transactionRef, ExceptionOutcome outcome) {
+        ExceptionCode avroCode = switch (outcome.getExceptionCode()) {
+            case MISSING_SOURCE -> ExceptionCode.MISSING_SOURCE;
+            case AMOUNT_MISMATCH -> ExceptionCode.AMOUNT_MISMATCH;
+            case CURRENCY_MISMATCH -> ExceptionCode.CURRENCY_MISMATCH;
+            case DUPLICATE_TRANSACTION_REF -> ExceptionCode.DUPLICATE_TRANSACTION_REF;
+            case ORPHAN_EVENT -> ExceptionCode.ORPHAN_EVENT;
+            case LATE_ARRIVAL -> ExceptionCode.LATE_ARRIVAL;
+        };
+
+        return ExceptionEvent.newBuilder()
+                .setTransactionRef(transactionRef)
+                .setExceptionCode(avroCode)
+                .setSourcesPresent(outcome.getSourcesPresent())
+                .setRawLedgerEvent(outcome.getRawLedgerEvent())
+                .setRawPspEvent(outcome.getRawPspEvent())
+                .setRawBankEvent(outcome.getRawBankEvent())
+                .setDetectedAt(Instant.now())
+                .setResultId(UUID.randomUUID().toString())
                 .build();
     }
 }

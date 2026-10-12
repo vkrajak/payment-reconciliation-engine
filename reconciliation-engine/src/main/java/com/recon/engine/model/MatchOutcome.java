@@ -23,6 +23,13 @@ public class MatchOutcome {
     String currency;
     Long settlementLagMs;
 
+    // PHASE 4 ADDITION, audit-only -- carried through to ReconciliationResult's
+    // ledgerEventId/pspEventId/bankEventId fields. Not used for dedup (see
+    // ReconciliationResult.avsc doc on resultId being the actual idempotency key).
+    String ledgerEventId;
+    String pspEventId;
+    String bankEventId;
+
     public enum MatchStatus {
         MATCHED, MATCHED_WITH_TOLERANCE, SETTLEMENT_LAG_WARNING
     }

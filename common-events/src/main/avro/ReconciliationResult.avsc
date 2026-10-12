@@ -2,7 +2,7 @@
   "type": "record",
   "name": "ReconciliationResult",
   "namespace": "com.recon.events",
-  "doc": "Emitted by reconciliation-engine to topic 'recon-results' whenever the matching rule chain resolves a transactionRef (see blueprint sec 5.2). Consumed by dashboard-api to update Redis. camelCase field names deliberately -- see LedgerEvent.avsc doc.",
+  "doc": "Emitted by reconciliation-engine to topic 'recon-results' whenever the matching rule chain resolves a transactionRef (see blueprint sec 5.2). Consumed by dashboard-api to update Redis, and by the sink's idempotency layer (blueprint sec 4.3, Phase 4). camelCase field names deliberately -- see LedgerEvent.avsc doc.",
   "fields": [
     {"name": "transactionRef", "type": "string"},
     {
@@ -45,6 +45,28 @@
       "type": "int",
       "default": 1,
       "doc": "Incremented if a late-arriving event causes re-evaluation of an already-resolved transactionRef (see LATE_ARRIVAL in the exception taxonomy)."
+    },
+    {
+      "name": "resultId",
+      "type": "string",
+      "default": "",
+      "doc": "PHASE 4 ADDITION. A UUID minted fresh by reconciliation-engine every time it emits a ReconciliationResult -- this, not transactionRef, is the idempotency key the sink's processed_events table dedupes on (blueprint sec 4.3). See MatchedResultListener's class doc for why: the underlying LedgerEvent/PspEvent/BankEvent event_ids get merged by the time a result reaches here, so a new id scoped to THIS emitted result plays the role blueprint sec 4.3's generic 'event_id' plays upstream. Default '' only exists to satisfy Schema Registry's BACKWARD compatibility check for this added field; every real producer always sets it."
+    },
+    {
+      "name": "ledgerEventId",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "PHASE 4 ADDITION, audit-only. The eventId of the specific LedgerEvent this result was built from -- not used for dedup (resultId is), kept so a person debugging a mismatch can trace back to the exact source message."
+    },
+    {
+      "name": "pspEventId",
+      "type": ["null", "string"],
+      "default": null
+    },
+    {
+      "name": "bankEventId",
+      "type": ["null", "string"],
+      "default": null
     }
   ]
 }
