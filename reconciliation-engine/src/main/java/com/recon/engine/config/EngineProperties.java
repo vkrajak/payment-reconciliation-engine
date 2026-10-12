@@ -16,6 +16,7 @@ public class EngineProperties {
     private String pspTopic;               // psp-events
     private String bankTopic;              // bank-events
     private String reconResultsTopic;      // recon-results
+    private String exceptionEventsTopic;   // exception-events -- PHASE 5 addition
     private String stateStoreName;         // name of the session-window aggregate's state store
 
     private long sessionWindowMinutes;     // blueprint sec 5.1: 30 min default
@@ -23,5 +24,5 @@ public class EngineProperties {
 
     private BigDecimal toleranceAmount;    // blueprint sec 5.2 rule 2: max |amount diff| still considered a match
     private long settlementLagWarningThresholdMs; // blueprint sec 5.2 rule 3: posted_at vs value_date gap that
-                                                    // downgrades a MATCHED result to SETTLEMENT_LAG_WARNING
+    // downgrades a MATCHED result to SETTLEMENT_LAG_WARNING
 }

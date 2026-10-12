@@ -44,6 +44,12 @@
     {
       "name": "detectedAt",
       "type": {"type": "long", "logicalType": "timestamp-millis"}
+    },
+    {
+      "name": "resultId",
+      "type": "string",
+      "default": "",
+      "doc": "PHASE 5 ADDITION, mirrors ReconciliationResult.resultId (see that field's doc in ReconciliationResult.avsc for the full rationale). A UUID minted fresh by reconciliation-engine every time it emits an ExceptionEvent -- this is the idempotency key exception-classifier's sink dedupes on via the SAME processed_events table reconciliation-engine's sink uses, since both are just UUIDs with no FK back to a specific result type. Default '' only exists to satisfy Schema Registry's BACKWARD compatibility check; every real producer always sets it."
     }
   ]
 }

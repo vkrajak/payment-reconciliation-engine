@@ -100,6 +100,7 @@
         <module>psp-simulator</module>
         <module>bank-file-ingester</module>
         <module>reconciliation-engine</module>
+        <module>exception-classifier</module>
     </modules>
 
     <build>
