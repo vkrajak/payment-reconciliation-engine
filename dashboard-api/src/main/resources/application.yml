@@ -1,0 +1,54 @@
+server:
+  port: 8086
+
+spring:
+  application:
+    name: dashboard-api
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/recon}
+    username: ${DB_USER:recon}
+    password: ${DB_PASSWORD:recon}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 500ms            # bounded: Redis down = slower dashboard, not a hung one
+      connect-timeout: 500ms
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: dashboard-api
+
+dashboard:
+  timezone: Asia/Kolkata          # default "today" for /metrics/summary
+  cors:
+    allowed-origins: http://localhost:3000,http://localhost:5173   # Phase 7 UI dev servers
+  metrics:
+    refresh-ms: 300000            # pre-warm today's summary every 5 min (= cache TTL)
+    initial-delay-ms: 15000
+  engine:
+    expected-partitions: 6        # = partitions of ledger/psp/bank topics
+  live:
+    matches-enabled: true
+    matches-topic: recon-results
+    flush-interval-ms: 500
+    sample-size: 50
+    exception-poll-ms: 1000
+    keepalive-ms: 15000
