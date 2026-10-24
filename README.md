@@ -519,3 +519,282 @@ com.recon.classifier
 1. Add the value to `ExceptionCode` (in `common-events`).
 2. Create a `ClassificationRule` bean with an `@Order` that places it correctly in the chain.
 3. Add a case to `ClassificationChainTest` (and to the chain list in `ExceptionServiceIdempotencyIT` if relevant).
+
+# Phase 6: what to add to the repo
+
+Redis caching layer + dashboard-api REST endpoints. Unzip over the repo root; paths match the monorepo layout.
+
+## 1. Files
+
+**New**
+
+| Path | What |
+|---|---|
+| `dashboard-api/` | New module: REST API, Redis cache, SSE stream, tests, Dockerfile, README |
+| `common-events/.../events/cache/` | `RedisKeys`, `TxnStatusDoc`, `TxnStatusCodec` (shared key names, TTLs, JSON shape) |
+| `reconciliation-engine/.../engine/cache/` | `TxnStatusWriter` (write-through), `EngineHeartbeat`, `EngineCacheConfig` |
+| `exception-classifier/.../classifier/cache/TxnStatusWriter.java` | Updates `txn:status` for exceptions |
+| `docs/adr/008-redis-cache-only-write-through.md` | Decision record |
+| `monitoring/alerts/recon-dashboard.yml` | Prometheus alert rules |
+| `docker-compose.dashboard-api.snippet.yml` | Compose service to merge |
+
+**Replaced (Phase 5 files, overwrite them)**
+
+| Path | Change |
+|---|---|
+| `exception-classifier/.../consumer/ExceptionCandidateListener.java` | After the DB commit, updates Redis (skips `LATE_ARRIVAL`) |
+| `exception-classifier/.../persistence/ExceptionRepository.java` | `upgradeMissingToOrphan` now `RETURNING transaction_ref` and returns `List<String>` |
+| `exception-classifier/.../job/OrphanSweepJob.java` | Refreshes Redis for upgraded refs |
+
+The Phase 5 tests (`ClassificationChainTest`, `ExceptionServiceIdempotencyIT`) are unaffected.
+
+# dashboard-api
+
+Phase 6 of the Real-Time Payment Reconciliation & Exception Engine.
+
+Read/triage API for the ops dashboard. Serves live metrics and transaction status from **Redis** (fast path), falls back
+to **Postgres** (source of truth), lets ops resolve exceptions with an audit trail, and streams new exceptions/matches
+over **Server-Sent Events**. This module never writes matches or classifies exceptions; it only reads them, plus the
+resolve action.
+
+```
+                         ┌───────────────────────────── dashboard-api (8086) ─────────────────────────────┐
+ browser / Phase 7 UI ──►│ /metrics/summary   Redis metrics:* ──miss──► Postgres aggregates ──► write back │
+                         │ /transactions/{ref} Redis txn:status ─miss──► Postgres (match/exception) ──► WB │
+                         │ /exceptions[/{id}] Postgres (JPA)         POST /resolve ──► Postgres, then Redis │
+                         │ /engine/health     Redis engine:heartbeat:*                                      │
+                         │ /stream/live  ◄── Kafka recon-results (matches, batched) + exceptions table poll │
+                         └──────────────────────────────────────────────────────────────────────────────────┘
+ written elsewhere:  engine ─► txn:status (matches), engine:heartbeat   |   exception-classifier ─► txn:status (exceptions)
+```
+
+## Endpoints
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/v1/metrics/summary?date=yyyy-MM-dd` | Defaults to today in `dashboard.timezone`. `servedFrom` is `CACHE` or `DATABASE`. |
+| GET | `/api/v1/exceptions?status=OPEN&code=AMOUNT_MISMATCH&page=0&size=20` | Newest first. `size` capped at 100. Bad `status`/`code` returns 400. |
+| GET | `/api/v1/exceptions/{id}` | Drill-down: raw events from every source plus a per-field `comparison` with a `differs` flag. |
+| POST | `/api/v1/exceptions/{id}/resolve` | Body `{ "resolvedBy": "...", "note": "..." }`. 200, 404 unknown, 409 already resolved, 400 invalid. |
+| GET | `/api/v1/transactions/{transactionRef}` | Redis first, Postgres fallback (written back to Redis). 404 if unknown. |
+| GET | `/api/v1/stream/live` | SSE. Events: `connected`, `exception`, `matches`. |
+| GET | `/api/v1/engine/health` | **Addition beyond the blueprint table.** `UP` / `DEGRADED` / `DOWN` / `UNKNOWN` from heartbeats. |
+| GET | `/actuator/prometheus` | Micrometer metrics. Health probes at `/actuator/health/liveness` and `/readiness`. |
+
+Errors use RFC 7807 problem responses (`{"status":404,"detail":"..."}`).
+
+### Examples
+
+```bash
+curl 'localhost:8086/api/v1/metrics/summary?date=2026-10-06'
+curl 'localhost:8086/api/v1/exceptions?status=OPEN&size=5'
+curl 'localhost:8086/api/v1/exceptions/42'
+curl -X POST localhost:8086/api/v1/exceptions/42/resolve \
+     -H 'Content-Type: application/json' \
+     -d '{"resolvedBy":"ops.user","note":"Confirmed with bank, ledger corrected"}'
+curl 'localhost:8086/api/v1/transactions/TXN-1001'
+curl localhost:8086/api/v1/engine/health
+curl -N localhost:8086/api/v1/stream/live          # -N = don't buffer
+```
+
+Abridged `/transactions/{ref}` response:
+
+```json
+{ "transactionRef": "TXN-1001", "status": "MATCHED", "exceptionCode": null,
+  "matchedAt": "2026-10-06T06:00:00Z", "updatedAt": "2026-10-06T06:00:00Z",
+  "sources": ["BANK","LEDGER","PSP"], "servedFrom": "CACHE" }
+```
+
+`status` is one of `MATCHED`, `MATCHED_WITH_TOLERANCE`, `EXCEPTION`, `RESOLVED`.
+
+## Redis keys
+
+All names and TTLs live in one class, `common-events/.../cache/RedisKeys.java`, shared by engine, classifier and this API.
+
+| Key | Value | TTL | Written by |
+|---|---|---|---|
+| `txn:status:{ref}` | `{status, matched_at, sources, exception_code, updated_at}` | 24h | engine (matches), classifier (exceptions), this API (resolve, read-through) |
+| `metrics:summary:{date}` | full summary JSON (what `/metrics/summary` reads) | 5 min | this API |
+| `metrics:mismatch_rate:{date}` | float, percent | 5 min | this API |
+| `metrics:settlement_lag:p50\|p95\|p99:{date}` | float, milliseconds | 5 min | this API |
+| `engine:heartbeat:{partition}` | epoch millis | 30s | engine, every 10s per owned partition |
+
+`metrics:summary` is an addition so one request is one Redis read; the blueprint's per-metric keys are written too.
+
+## Behaviour you should know
+
+- **Redis is a cache, never the durability boundary.** Every Redis call goes through `CacheGateway`: failures are logged,
+  counted (`dashboard_cache_requests_total{result="error"}`) and treated as a miss. Redis down = slower dashboard, no
+  data lost. Client timeouts are 500ms so a dead Redis cannot hang requests.
+- **Write-through order is Postgres first, Redis second.** Resolve commits to Postgres, then updates Redis only if it
+  currently shows that transaction as an open `EXCEPTION` (it never overwrites a newer `MATCHED`).
+- **Most recent wins in the Postgres fallback.** If a transaction has both a match and an exception, the later of the two
+  decides the status. `LATE_ARRIVAL` rows are bookkeeping and ignored for status.
+- **Metrics definitions.** `totalTransactions` = distinct matched + distinct exception transactions for the day.
+  `mismatchRatePct` = exceptions / total. `LATE_ARRIVAL` is excluded. `openExceptions` is the all-time OPEN backlog,
+  not limited to the day. Lag values are milliseconds from `matched_transactions.settlement_lag_ms`.
+- **Day boundaries** use `dashboard.timezone` (default `Asia/Kolkata`) for exceptions (by `first_detected_at`) and the
+  `business_date` column for matches.
+- **Pre-warming.** `MetricsRefreshJob` recomputes today's summary every 5 minutes (same as the TTL).
+- **Live stream.** New exceptions are pushed from the `exceptions` table (so they carry the *classified* code), polled
+  every second. Matches are tailed from the `recon-results` topic and sent as one batched `matches` event every 500ms:
+  `{count, dropped, sample[]}`, never one SSE message per match. The payload is passed through untouched, so it does not
+  depend on the `recon-results` schema. Nothing is buffered while no browser is connected. Each instance uses a unique
+  Kafka group id, so every instance sees every record.
+
+## Configuration (`application.yml`)
+
+| Property / env | Default | Purpose |
+|---|---|---|
+| `DB_URL` / `DB_USER` / `DB_PASSWORD` | `jdbc:postgresql://localhost:5432/recon` / `recon` / `recon` | Postgres |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis |
+| `KAFKA_BOOTSTRAP` | `localhost:9092` | Only for the live match feed |
+| `dashboard.timezone` | `Asia/Kolkata` | Default "today" and exception day windows |
+| `dashboard.cors.allowed-origins` | `http://localhost:3000,http://localhost:5173` | Phase 7 UI dev servers |
+| `dashboard.engine.expected-partitions` | `6` | Partitions of ledger/psp/bank topics (for engine health) |
+| `dashboard.live.matches-enabled` | `true` | Set `false` to disable the Kafka match feed (SSE still serves exceptions) |
+| `dashboard.live.matches-topic` | `recon-results` | Topic to tail |
+| `dashboard.metrics.refresh-ms` | `300000` | Pre-warm interval |
+
+## Run
+
+```bash
+# Postgres (with the Phase 5 `exceptions` table and your `matched_transactions`), Redis, optionally Kafka
+mvn -pl dashboard-api -am spring-boot:run
+# or
+docker build -f dashboard-api/Dockerfile -t dashboard-api . && docker run --network host dashboard-api
+```
+
+## Tests
+
+```bash
+mvn -pl dashboard-api test      # unit: diff assembler, metrics service (cache hit/miss/zero traffic), lookup service
+mvn -pl dashboard-api verify    # + DashboardApiIT (Testcontainers Postgres and Redis; needs Docker)
+```
+
+`DashboardApiIT` covers: list filters/pagination/validation, side-by-side diff, resolve (audit fields, 409 on repeat,
+400/404 cases, `X-Resolved-By` header), Postgres-then-Redis lookup with TTL, resolve refreshing the cached status,
+metrics compute-then-cache with percentiles, and engine health UP/DEGRADED/DOWN. SSE and the Kafka feed are verified
+manually (below).
+
+### Manual SSE check
+
+```bash
+curl -N localhost:8086/api/v1/stream/live
+# in another terminal: insert/classify an exception (see exception-classifier README smoke test)
+# expected: "event: exception" with the classified code within ~1s; "event: matches" batches if recon-results is flowing
+```
+
+## Metrics
+
+`dashboard_cache_requests_total{result="hit|miss|error"}` (cache effectiveness and Redis health), plus the standard
+Spring Boot / JVM / HTTP server metrics. Alert rules: `monitoring/alerts/recon-dashboard.yml`.
+
+## Known limitations (v1)
+
+- **No authentication.** `resolvedBy` comes from the body or `X-Resolved-By` and is trusted. Put it behind your gateway
+  or add Spring Security before exposing it. This is a deliberate v1 scope cut.
+- **Live exceptions are best-effort.** The poller follows `id` order; a row from a slow transaction that commits with a
+  lower id than one already pushed can be missed in the stream. `GET /exceptions` is authoritative.
+- **No cache-stampede protection.** On TTL expiry several concurrent requests can each recompute; the pre-warm job makes
+  this unlikely for "today". Add a lock if traffic grows.
+- **One resolve per exception, no reopen/acknowledge endpoints** (not in the blueprint).
+- **Redis heartbeats show liveness, not lag.** Consumer lag lives in Prometheus/Grafana (Phase 10).
+
+
+## 2. Build config edits (not shipped as files, since I can't see your poms)
+
+**Root `pom.xml`**: add `<module>dashboard-api</module>`.
+
+**`common-events/pom.xml`**: add (version managed by the Spring Boot BOM):
+
+```xml
+<dependency>
+    <groupId>com.fasterxml.jackson.datatype</groupId>
+    <artifactId>jackson-datatype-jsr310</artifactId>
+</dependency>
+```
+
+**`reconciliation-engine/pom.xml`** and **`exception-classifier/pom.xml`**: add if not already present:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+```
+
+**`application.yml` of the engine and the classifier**: add (the Phase 0 compose Redis service is assumed to be `redis`):
+
+```yaml
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 500ms
+      connect-timeout: 500ms
+```
+
+Engine only (optional): `recon.heartbeat.interval-ms: 10000`.
+
+**docker-compose**: merge `docker-compose.dashboard-api.snippet.yml`; add `REDIS_HOST: redis` to the classifier's environment.
+
+## 3. Engine hook (the one manual integration point)
+
+I haven't seen your engine code, so call the writer **right after the `matched_transactions` insert** succeeds:
+
+```java
+private final TxnStatusWriter txnStatusWriter;   // com.recon.engine.cache.TxnStatusWriter
+
+// after the Postgres insert for a match:
+txnStatusWriter.recordMatched(
+        transactionRef,
+        tolerance ? TxnStatusDoc.MATCHED_WITH_TOLERANCE : TxnStatusDoc.MATCHED,
+        matchedAt,                                   // Instant
+        List.of("LEDGER", "PSP", "BANK"));           // the sources that took part
+```
+
+- If the call runs inside a Spring `@Transactional` method, the Redis write is automatically deferred to `afterCommit`.
+  Inside a plain Kafka Streams processor (no Spring transaction) it runs immediately, so call it only after the insert returned.
+- `EngineHeartbeat` assumes Spring Kafka's `StreamsBuilderFactoryBean` (`@EnableKafkaStreams`). With a hand-built
+  `KafkaStreams` it stays idle; tell me and I'll adapt it.
+- Engine code needs `@EnableScheduling`; `EngineCacheConfig` provides it.
+
+## 4. Assumptions to check
+
+- `matched_transactions` has the blueprint columns used by the SQL: `transaction_ref, match_version, match_status,
+  ledger_amount, psp_amount, bank_amount, settlement_lag_ms, matched_at, business_date`. If your Phase 3-4 DDL renamed
+  any, adjust `MetricsRepository` and `TransactionLookupRepository` (the only two classes that touch that table).
+- The `recon-results` topic exists if you want the live match feed (`dashboard.live.matches-enabled: false` otherwise).
+- Spring Boot 3.3+ / Java 21 (`buildConsumerProperties(null)` and `ProblemDetail` need Boot 3.2+).
+
+## 5. Verify end to end
+
+```bash
+docker compose up -d                       # postgres, redis, broker, classifier, dashboard-api
+curl localhost:8086/actuator/health
+
+# 1. An exception (see exception-classifier README smoke test), then:
+redis-cli GET txn:status:TXN-1001          # EXCEPTION / MISSING_SOURCE, TTL ~86400
+curl localhost:8086/api/v1/transactions/TXN-1001      # servedFrom CACHE
+curl localhost:8086/api/v1/exceptions?status=OPEN
+curl -X POST localhost:8086/api/v1/exceptions/1/resolve -H 'Content-Type: application/json' \
+     -d '{"resolvedBy":"ops.user","note":"checked"}'
+redis-cli GET txn:status:TXN-1001          # now RESOLVED
+
+# 2. Metrics cached for 5 minutes
+curl "localhost:8086/api/v1/metrics/summary"           # DATABASE, then CACHE on the 2nd call
+redis-cli TTL metrics:mismatch_rate:$(date +%F)
+
+# 3. Redis outage: the API keeps answering from Postgres
+docker compose stop redis && curl localhost:8086/api/v1/transactions/TXN-1001   # servedFrom DATABASE
+docker compose start redis
+
+# 4. Engine heartbeat (with the engine running)
+redis-cli KEYS 'engine:heartbeat:*'        # 6 keys; curl localhost:8086/api/v1/engine/health -> UP
+```
+
+## 6. Not in this phase
+
+Auth on the API, the React UI (Phase 7), Kubernetes manifests/HPA for dashboard-api (Phase 9), Grafana dashboards (Phase 10).

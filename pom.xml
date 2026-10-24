@@ -101,6 +101,7 @@
         <module>bank-file-ingester</module>
         <module>reconciliation-engine</module>
         <module>exception-classifier</module>
+        <module>dashboard-api</module>
     </modules>
 
     <build>
