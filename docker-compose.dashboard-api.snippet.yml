@@ -1,0 +1,16 @@
+# Merge under `services:` in your docker-compose.yml. Service names (postgres, redis, redpanda) must match yours.
+  dashboard-api:
+    build:
+      context: .
+      dockerfile: dashboard-api/Dockerfile
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/recon
+      DB_USER: recon
+      DB_PASSWORD: recon
+      REDIS_HOST: redis
+      KAFKA_BOOTSTRAP: redpanda:9092        # or kafka:9092
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "8086:8086"
