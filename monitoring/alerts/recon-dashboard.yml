@@ -1,0 +1,25 @@
+groups:
+  - name: recon-dashboard-cache
+    rules:
+      - alert: DashboardRedisErrors
+        expr: sum(rate(dashboard_cache_requests_total{result="error"}[5m])) > 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "dashboard-api cannot reach Redis; serving from Postgres (slower, no data loss)"
+
+      - alert: ReconRedisWriteFailures
+        expr: sum(increase(recon_redis_write_failures_total[5m])) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "engine/classifier failing to update Redis; cached statuses may be stale until TTL"
+
+      - alert: DashboardCacheHitRatioLow
+        expr: |
+          sum(rate(dashboard_cache_requests_total{result="hit"}[15m]))
+            / sum(rate(dashboard_cache_requests_total{result=~"hit|miss"}[15m])) < 0.5
+        for: 15m
+        labels: { severity: info }
+        annotations:
+          summary: "Cache hit ratio below 50%: check TTLs, the pre-warm job, or key churn"
