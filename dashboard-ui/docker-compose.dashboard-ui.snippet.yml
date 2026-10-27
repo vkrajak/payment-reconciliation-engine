@@ -1,0 +1,10 @@
+# Merge under `services:` in your docker-compose.yml.
+  dashboard-ui:
+    build:
+      context: dashboard-ui
+    environment:
+      DASHBOARD_API_URL: http://dashboard-api:8086   # compose service name of dashboard-api
+    depends_on:
+      - dashboard-api
+    ports:
+      - "3000:80"

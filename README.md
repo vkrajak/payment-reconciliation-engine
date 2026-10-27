@@ -795,6 +795,96 @@ docker compose start redis
 redis-cli KEYS 'engine:heartbeat:*'        # 6 keys; curl localhost:8086/api/v1/engine/health -> UP
 ```
 
-## 6. Not in this phase
+# Phase 7, part 1: what to add to the repo
 
-Auth on the API, the React UI (Phase 7), Kubernetes manifests/HPA for dashboard-api (Phase 9), Grafana dashboards (Phase 10).
+Unzip over the repo root. Everything is new and lives in `dashboard-ui/`; nothing existing is modified.
+
+1. Install Node.js 20 or newer (the only new software): `node -v`.
+2. `cd dashboard-ui && npm install`
+3. Start the stack so `dashboard-api` is reachable on `localhost:8086` (Postgres, Redis, Kafka, engine, classifier, dashboard-api).
+4. `npm run dev`, then open `http://localhost:3000`.
+
+Check it works:
+
+| Do this | You should see |
+|---|---|
+| Open Overview | A matched percentage that equals `curl localhost:8086/api/v1/metrics/summary` (`matchRatePct`) |
+| Check the engine panel | Six partition cells, green when the engine is beating, dashed red when missing |
+| Raise an exception through the pipeline | It appears in the Live feed within a few seconds, with a link to `/exceptions/{id}` (404 page until part 2) |
+| Stop `dashboard-api` | A red banner "Cannot reach the dashboard API"; start it again and press **Try again** |
+| Find a transaction with a known ref | Status, cause and sources; an unknown ref gives a plain "No transaction found" sentence |
+
+# Phase 7, part 2: what to add to the repo
+
+Completes `dashboard-ui` (Exceptions triage, drill-down with resolve, Docker/nginx). Unzip over the repo root,
+**after** part 1. Nothing outside `dashboard-ui/` changes, and `package.json` / `package-lock.json` are unchanged,
+so there is nothing new to install.
+
+## 1. Files
+
+**Replaced (part 1 files, overwrite them)**
+
+| Path | Change |
+|---|---|
+| `src/pages/ExceptionsPage.tsx` | Part 1 stub becomes the triage list |
+| `src/App.tsx` | Adds the `exceptions/:id` route |
+| `src/components/Layout.tsx` | Adds the "Resolving as …" control to the header |
+| `src/styles.css` | Same file plus the part 2 rules (list, drill-down, resolve form) |
+| `src/test/fakes.ts` | `mockFetch` now exposes the request init (needed to inspect POST bodies) |
+| `src/test/fixtures.ts` | Adds exception fixtures |
+| `README.md` | Final version |
+
+**New**
+
+| Path | What |
+|---|---|
+| `src/pages/ExceptionDetailPage.tsx` | Side-by-side diff, classification explanation, resolve form, audit view |
+| `src/components/OperatorControl.tsx`, `src/hooks/useOperator.ts` | Operator name, remembered in the browser |
+| `src/lib/compare.ts` | Comparison columns, cell formatting, classification as readable rows |
+| `src/**/*.test.*` | 5 new test files (list below) |
+| `Dockerfile`, `nginx.conf.template`, `.dockerignore` | Multi-stage image, nginx with SSE-safe proxy |
+| `docker-compose.dashboard-ui.snippet.yml` | Compose service to merge |
+
+New tests: `ExceptionsPage`, `ExceptionDetailPage`, `useOperator`, `compare`, `client` (plus the replaced `fakes.ts`/`fixtures.ts`).
+
+## 2. Verify
+
+```bash
+cd dashboard-ui
+npm test            # 34 tests
+npm run build
+npm run dev         # http://localhost:3000 (dashboard-api on :8086)
+```
+
+| Do this | You should see |
+|---|---|
+| Click an Overview "Exceptions by cause" row | `/exceptions?code=…` with that cause pre-selected and Status = Open |
+| Open an exception from the list | Sources side by side; differing rows highlighted; a source that never reported shows "No event" |
+| Raise a new exception through the pipeline while the list is open | A banner "1 new exception arrived…" (rows do not move); **Show it** adds it |
+| Resolve it with a name and a note | The form is replaced by Resolved + who/when/note; the list and Overview open-count update |
+| `curl localhost:8086/api/v1/exceptions/<id>` | `status: RESOLVED`, your `resolvedBy` and note |
+| Resolve the same exception from a second tab | "Someone resolved this exception while you were reading it", then their resolution |
+| Stop `dashboard-api` | Red "Cannot reach the dashboard API" banner with **Try again**; recovers when it is back |
+
+Docker (compose):
+
+```bash
+# merge docker-compose.dashboard-ui.snippet.yml under services:, then
+docker compose up -d --build dashboard-ui
+curl localhost:3000/healthz                      # ok
+curl localhost:3000/api/v1/metrics/summary       # proxied to dashboard-api
+```
+
+Open `http://localhost:3000/exceptions/<id>` directly and refresh: it should load (deep-link fallback).
+Leave the Overview open for a minute: the live panel should stay "Live" (no buffering stall).
+
+## 3. Assumptions to check
+
+- The dashboard-api compose service is named `dashboard-api` and listens on 8086. If not, set `DASHBOARD_API_URL` in the snippet.
+- Docker Compose DNS (`127.0.0.11`) is used by nginx. For Kubernetes (Phase 9) set `NGINX_RESOLVER` to the cluster DNS.
+- The image build has not been run here (no Docker in my environment). The nginx config itself was run against a fake API and behaved as intended: SPA fallback, caching headers, proxy, unbuffered live stream.
+
+## 4. Not covered
+
+Authentication and real operator identity, an Acknowledge/reopen action (the API has none), a trend view, and rendering the raw `recon-results` payload. See the README's known limits.
+
