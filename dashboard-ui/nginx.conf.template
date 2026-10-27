@@ -1,0 +1,63 @@
+# Rendered at container start by the nginx image's envsubst step:
+#   DASHBOARD_API_URL  where dashboard-api listens, default http://dashboard-api:8086
+#   NGINX_RESOLVER     DNS server nginx uses to look that name up, default 127.0.0.11 (Docker's embedded DNS)
+# The API address is held in a variable on purpose: nginx then resolves it per request, so the UI container
+# still starts if dashboard-api is not up yet and follows it when it restarts with a new IP.
+
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    resolver ${NGINX_RESOLVER} valid=10s ipv6=off;
+    set $dashboard_api ${DASHBOARD_API_URL};
+
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy same-origin always;
+    add_header X-Frame-Options DENY always;
+
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # Server-Sent Events: no buffering, no gzip, and a read timeout longer than the server's 30-minute stream.
+    location = /api/v1/stream/live {
+        proxy_pass $dashboard_api;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_buffering off;
+        proxy_cache off;
+        gzip off;
+        add_header X-Accel-Buffering no always;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+
+    location /api/ {
+        proxy_pass $dashboard_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 30s;
+    }
+
+    # Hashed build output never changes under the same name.
+    location /assets/ {
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+
+    # Single-page app: unknown paths (e.g. /exceptions/12 on reload) get index.html, which must never be cached.
+    location / {
+        add_header Cache-Control "no-cache";
+        try_files $uri /index.html;
+    }
+}
